@@ -216,16 +216,6 @@ function round(num, numDecimalPlaces)
   return math.ceil(num * mult + 0.5) / mult
 end
 
-function get_virt_scale_factor()
-    local width = mp.get_property_native("width")
-    local height = mp.get_property_native("height")
-    local w, h = mp.get_osd_size()
-    if w <= 0 or h <= 0 then
-        return 0, 0
-    end
-    return width / w, height / h
-end
-
 local function tick(copy)
     if events == nil then return end
     pos = mp.get_property_native("time-pos")
@@ -243,11 +233,9 @@ local function tick(copy)
     local events = events_at(pos * 1000)
     table.sort(events, compare_subs)
     local ass = assdraw.ass_new()
-    local scale_x, scale_y = get_virt_scale_factor()
-    local bigscale = scale_y
-    if scale_x > scale_y then
-        bigscale = scale_x
-    end
+    local scale_x = width / w
+    local scale_y = height / h
+    local bigscale = math.max(scale_x, scale_y)
     local offset_x = (w - width / bigscale) * bigscale / 2
     local offset_y = (h - height / bigscale) * bigscale / 2
     local x, y = mp.get_mouse_pos()
