@@ -33,12 +33,14 @@ local ass = ffi.load("C:/Path/libass-9.dll", true)
 local utils = require "mp.utils"
 local assdraw = require "mp.assdraw"
 
-local tmpass = "C:\\Users\\User\\AppData\\Local\\Temp\\subselect\\subs.ass"
+local scripts_dir = mp.command_native({"expand-path", "~~home/scripts"})
+local fonts_dir = utils.join_path(scripts_dir, "shared/fonts")
+local tmpass = utils.join_path(scripts_dir, "shared/subs.ass")
 
 local cache = {pos = -1, last = 0, w = -1, h = -1, events = {}, bounds = {}, mouse = {pos_x = -1, pos_y = -1, last = 0, autohide = nil}}
 
-local pos = nil
 local skip = false
+local use_fonts = true
 
 local function strdup(src)
     local dst = ffi.C.malloc(ffi.C.strlen(src) + 1)
@@ -53,27 +55,28 @@ local function copy_tmpfile(reload)
             local working_directory = mp.get_property_native("working-directory")
             local path = mp.get_property_native("path")
             local file = utils.join_path(working_directory, path)
-            mp.command_native{"subprocess", {
-                "python",
-                "C:\\Users\\MainUserW\\AppData\\Roaming\\mpv\\scripts\\shared\\attachments.py",
-                file
-            }}
+            local index = nil
             if not v.external then
-                local index = v["ff-index"]
-                mp.command_native{"subprocess", {
-                    "ffmpeg", "-loglevel", "8",
-                    "-i", file,
-                    "-map", "0:" .. index,
-                    "-y", tmpass
-                }}
-                -- mp.command_native{"subprocess", {
-                --     "mkvextract",
-                --     "tracks", file,
-                --     index .. ":" .. tmpass
-                -- }}
+                fonts = utils.readdir(fonts_dir, "files")
+                if fonts then
+                    for  _, font in ipairs(fonts) do
+                        os.remove(utils.join_path(fonts_dir, font))
+                    end
+                end
+                use_fonts = true
+                index = v["ff-index"]
             else
+                use_fonts = false
                 tmpass = v["external-filename"]
             end
+            mp.command_native{"subprocess", {
+                "python",
+                utils.join_path(scripts_dir, "shared/attachments.py"),
+                fonts_dir,
+                file,
+                utils.to_string(index),
+                tmpass
+            }}
             skip = false
             return
         end
@@ -95,8 +98,10 @@ local function init_libass()
     end
     height = mp.get_property_native("height")
     ass.ass_set_frame_size(renderer, width, height)
-    ass.ass_set_fonts_dir(library, "C:/Users/MainUserW/AppData/Local/Temp/subselect/fonts");
-    ass.ass_set_fonts(renderer, nil, "sans-serif", 1, nil, 1);
+    if use_fonts then
+        ass.ass_set_fonts_dir(library, fonts_dir)
+    end
+    ass.ass_set_fonts(renderer, nil, "sans-serif", 1, nil, 1)
     track = ffi.gc(ass.ass_read_file(library, tmpass, nil), ass.ass_free_track)
     events = {}
     for i = 0, track.n_events-1 do
@@ -148,7 +153,6 @@ local function bounds(b_track, time, index)
     if cache.bounds[index] then
         return unpack(cache.bounds[index])
     end
-    print("uncached bounds")
     local change = ffi.new("int[1]")
     local image = ass.ass_render_frame(renderer, b_track, time, change)
     local min_x = width
@@ -170,6 +174,10 @@ local function bounds(b_track, time, index)
         end
         image = image.next
     end
+    min_x = min_x + cache.offset_x
+    min_y = min_y + cache.offset_y
+    max_x = max_x + cache.offset_x
+    max_y = max_y + cache.offset_y
     cache.bounds[index] = {min_x, min_y, max_x, max_y}
     return min_x, min_y, max_x, max_y
 end
@@ -187,9 +195,8 @@ local function events_at(time)
 end
 
 local function copy_subs(text)
-  print(text)
-  local res = utils.subprocess_detached({ args = {
-    'powershell', '-NoProfile', '-Command', string.format([[& {
+    print(text)
+    local res = mp.commandv("run", "powershell", "-NoProfile", "-Command", string.format([[& {
       Trap {
         Write-Error -ErrorRecord $_
         Exit 1
@@ -198,14 +205,13 @@ local function copy_subs(text)
       [System.Windows.Clipboard]::SetText(@"
 %s
 "@)
-    }]], text)
-  } })
+    }]], text))
 end
 
-function compare_subs(a,b)
+function compare_subs(a, b)
     if a.event.Layer == b.event.Layer then
-        local a_min_x, a_min_y, a_max_x, a_max_y = bounds(event_track(a.event, a.index), pos * 1000, a.index)
-        local b_min_x, b_min_y, b_max_x, b_max_y = bounds(event_track(b.event, b.index), pos * 1000, b.index)
+        local a_min_x, a_min_y, a_max_x, a_max_y = bounds(event_track(a.event, a.index), cache.pos, a.index)
+        local b_min_x, b_min_y, b_max_x, b_max_y = bounds(event_track(b.event, b.index), cache.pos, b.index)
         return (a_max_x - a_min_x) * (a_max_y - a_min_y) < (b_max_x - b_min_x) * (b_max_y - b_min_y)
     end
     return a.event.Layer > b.event.Layer
@@ -218,9 +224,13 @@ end
 
 local function tick(copy)
     if events == nil then return end
-    pos = mp.get_property_native("time-pos")
+    local pos = mp.get_property_native("time-pos")
     if not pos then return end
+    pos = pos * 1000
     local w, h = mp.get_osd_size()
+    local scale = math.max(width / w, height / h)
+    local border_x = (w - width / scale) / 2
+    local border_y = (h - height / scale) / 2
     if pos ~= cache.pos or w ~= cache.w or h ~= cache.h then
         cache.last = -1
         cache.pos = pos
@@ -228,23 +238,20 @@ local function tick(copy)
         cache.h = h
         cache.bounds = {}
         cache.events = {}
+        cache.offset_x = border_x * scale
+        cache.offset_y = border_y * scale
         cache.mouse.autohide = mp.get_property_native("cursor-autohide")
     end
-    local events = events_at(pos * 1000)
+    local events = events_at(pos)
     table.sort(events, compare_subs)
     local ass = assdraw.ass_new()
-    local scale_x = width / w
-    local scale_y = height / h
-    local bigscale = math.max(scale_x, scale_y)
-    local offset_x = (w - width / bigscale) * bigscale / 2
-    local offset_y = (h - height / bigscale) * bigscale / 2
     local x, y = mp.get_mouse_pos()
-    local pos_x = (x - (w - width / bigscale) / 2) * bigscale
-    local pos_y = (y - (h - height / bigscale) / 2) * bigscale
+    local pos_x = (x - border_x) * scale + cache.offset_x
+    local pos_y = (y - border_y) * scale + cache.offset_y
     for i, v in ipairs(events) do
         local track_event = event_track(v.event, v.index)
-        local min_x, min_y, max_x, max_y = bounds(track_event, pos * 1000, v.index)
-        if pos_x + offset_x > min_x + offset_x and pos_x + offset_x < max_x + offset_x and pos_y + offset_y > min_y + offset_y and pos_y + offset_y < max_y + offset_y then
+        local min_x, min_y, max_x, max_y = bounds(track_event, pos, v.index)
+        if pos_x > min_x and pos_x < max_x and pos_y > min_y and pos_y < max_y then
             if copy == true then
                 copy_subs(ffi.string(v.event.Text):gsub("{\\([^}]*p1.*?\\p0)[^}]*}", ""):gsub("{\\([^}]*p1)[^}]*}.*", ""):gsub("{\\[^}]+}", ""):gsub("\\N", "\n"):gsub("\\n", "\n"):gsub("\\h", " "))
             end
@@ -265,10 +272,10 @@ local function tick(copy)
             ass:append("{\\1a&HFF&}")
             ass:pos(0, 0)
             ass:draw_start()
-            ass:move_to(min_x + offset_x, min_y + offset_y)
-            ass:line_to(max_x + offset_x, min_y + offset_y)
-            ass:line_to(max_x + offset_x, max_y + offset_y)
-            ass:line_to(min_x + offset_x, max_y + offset_y)
+            ass:move_to(min_x, min_y)
+            ass:line_to(max_x, min_y)
+            ass:line_to(max_x, max_y)
+            ass:line_to(min_x, max_y)
             ass:draw_stop()
             mp.set_osd_ass(width, height, ass.text)
             return
