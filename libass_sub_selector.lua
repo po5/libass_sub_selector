@@ -1,3 +1,5 @@
+local libass_names = {"libass", "libass-4", "libass-5", "libass-9", "ass"}
+local libass_path = nil
 local ffi = require "ffi"
 ffi.cdef[[
 typedef struct ass_renderer ASS_Renderer;
@@ -28,81 +30,97 @@ void *malloc(size_t);
 char *strcpy(char *, const char *);
 size_t strlen(const char *s);
 ]]
-local ass = ffi.load("C:/Path/libass-9.dll", true)
+
+utils = require "mp.utils"
 
 local utils = require "mp.utils"
 local assdraw = require "mp.assdraw"
-
+local ffmpeg = nil
 local scripts_dir = mp.command_native({"expand-path", "~~home/scripts"})
-local fonts_dir = utils.join_path(scripts_dir, "shared/fonts")
-local tmpass = utils.join_path(scripts_dir, "shared/subs.ass")
 
-local cache = {pos = -1, last = 0, w = -1, h = -1, events = {}, bounds = {}, mouse = {pos_x = -1, pos_y = -1, last = 0, autohide = nil}}
+local ON_WINDOWS = (package.config:sub(1,1) ~= '/')
 
-local skip = false
-local use_fonts = true
+function file_exists(name)
+    local f = io.open(name, "rb")
+    if f ~= nil then
+        local ok, err, code = f:read(1)
+        io.close(f)
+        return code == nil
+    else
+        return false
+    end
+end
 
-local function strdup(src)
+function find_executable(name)
+    local delim = ON_WINDOWS and ";" or ":"
+
+    local pwd = os.getenv("PWD") or utils.getcwd()
+    local path = os.getenv("PATH")
+
+    local env_path = pwd .. delim .. path
+
+    local result, filename
+    for path_dir in env_path:gmatch("[^"..delim.."]+") do
+        filename = utils.join_path(path_dir, name)
+        if file_exists(filename) then
+            result = filename
+            break
+        end
+    end
+
+    return result
+end
+
+local options = {
+    paused_only = false,
+    on_hover = true,
+    autohide = true,
+    libass_path = "",
+    fonts_dir = utils.join_path(scripts_dir, "shared/fonts"),
+    tmp_ass = utils.join_path(scripts_dir, "shared/subs.ass")
+}
+
+mp.options = require "mp.options"
+mp.options.read_options(options, "libass_sub_selector")
+
+if options.libass_path == "" then
+    for _, libass_name in ipairs(libass_names) do
+        libass_name = ON_WINDOWS and (libass_name .. ".dll") or libass_name
+        libass_path = find_executable(libass_name)
+        if libass_path then break end
+    end
+
+    if not libass_path then
+        return mp.msg.error("Could not find libass path, tried the following:", table.concat(libass_names, ", "))
+    end
+else
+    libass_path = options.libass_path
+end
+
+local ass = ffi.load(libass_path, true)
+local tmp_ass = options.tmp_ass
+local cache = {file = nil, index = -1, pos = -1, last = 0, w = -1, h = -1, events = {}, bounds = {}, mouse = {pos_x = -1, pos_y = -1, last = 0, autohide = nil}}
+local show_all = false
+
+function strdup(src)
     local dst = ffi.C.malloc(ffi.C.strlen(src) + 1)
     return ffi.C.strcpy(dst, src)
 end
 
-local function copy_tmpfile(reload)
-    mp.set_osd_ass(0, 0, "")
-    local track_list = mp.get_property_native("track-list")
-    for i, v in ipairs(track_list) do
-        if v.type == 'sub' and v.selected and (v.codec == "ass" or v.codec == "ssa") then
-            local working_directory = mp.get_property_native("working-directory")
-            local path = mp.get_property_native("path")
-            local file = utils.join_path(working_directory, path)
-            local index = nil
-            if not v.external then
-                fonts = utils.readdir(fonts_dir, "files")
-                if fonts then
-                    for  _, font in ipairs(fonts) do
-                        os.remove(utils.join_path(fonts_dir, font))
-                    end
-                end
-                use_fonts = true
-                index = v["ff-index"]
-            else
-                use_fonts = false
-                tmpass = v["external-filename"]
-            end
-            mp.command_native{"subprocess", {
-                "python",
-                utils.join_path(scripts_dir, "shared/attachments.py"),
-                fonts_dir,
-                file,
-                utils.to_string(index),
-                tmpass
-            }}
-            skip = false
-            return
-        end
-    end
-    skip = true
-end
-
 local library, renderer, track, events, width, height
-local function init_libass()
-    if skip then
-        events = nil
-        return
-    end
+function init_libass(file, result)
+    if not file or file == true then file = options.tmp_ass end
+    if result and result.killed_by_us then return end
+    ffmpeg = nil
     library = ffi.gc(ass.ass_library_init(), ass.ass_library_done)
     renderer = ffi.gc(ass.ass_renderer_init(library), ass.ass_renderer_done)
     width = mp.get_property_native("width")
-    if not width then
-        return
-    end
+    if not width then return end
     height = mp.get_property_native("height")
     ass.ass_set_frame_size(renderer, width, height)
-    if use_fonts then
-        ass.ass_set_fonts_dir(library, fonts_dir)
-    end
+    ass.ass_set_fonts_dir(library, options.fonts_dir)
     ass.ass_set_fonts(renderer, nil, "sans-serif", 1, nil, 1)
-    track = ffi.gc(ass.ass_read_file(library, tmpass, nil), ass.ass_free_track)
+    track = ffi.gc(ass.ass_read_file(library, file, nil), ass.ass_free_track)
     events = {}
     for i = 0, track.n_events-1 do
         table.insert(events, track.events[i])
@@ -110,7 +128,17 @@ local function init_libass()
     return events
 end
 
-local function event_track(event, i)
+function clear_subs()
+    if events ~= nil then
+        mp.set_osd_ass(0, 0, "")
+        events = nil
+        cache.index = nil
+    end
+end
+
+local last_extracted = nil
+
+function event_track(event, i)
     if cache.events[i] then
         return cache.events[i]
     end
@@ -149,7 +177,7 @@ local function event_track(event, i)
     return ret
 end
 
-local function bounds(b_track, time, index)
+function bounds(b_track, time, index)
     if cache.bounds[index] then
         return unpack(cache.bounds[index])
     end
@@ -182,20 +210,17 @@ local function bounds(b_track, time, index)
     return min_x, min_y, max_x, max_y
 end
 
-local function events_at(time)
+function events_at(time)
     local ret = {}
-    local index = 1
     for i, v in ipairs(events) do
         if v.Start <= time and time < (v.Start + v.Duration) then
-            table.insert(ret, {event = v, index = index})
-            index = index + 1
+            table.insert(ret, {event = v, index = i})
         end
     end
     return ret
 end
 
-local function copy_subs(text)
-    print(text)
+function copy_subs(text)
     local res = mp.commandv("run", "powershell", "-NoProfile", "-Command", string.format([[& {
       Trap {
         Write-Error -ErrorRecord $_
@@ -217,15 +242,13 @@ function compare_subs(a, b)
     return a.event.Layer > b.event.Layer
 end
 
-function round(num, numDecimalPlaces)
-  local mult = 10^(numDecimalPlaces or 0)
-  return math.ceil(num * mult + 0.5) / mult
-end
-
-local function tick(copy)
+function tick(copy)
+    if copy == true and events == nil then copy_subs(mp.get_property_native("sub-text")) end
     if events == nil then return end
+    if options.paused_only and not mp.get_property_native("core-idle") then return mp.set_osd_ass(width, height, "") end
     local pos = mp.get_property_native("time-pos")
     if not pos then return end
+    pos = pos + mp.get_property_native("sub-delay")
     pos = pos * 1000
     local w, h = mp.get_osd_size()
     local scale = math.max(width / w, height / h)
@@ -240,32 +263,42 @@ local function tick(copy)
         cache.events = {}
         cache.offset_x = border_x * scale
         cache.offset_y = border_y * scale
-        cache.mouse.autohide = mp.get_property_native("cursor-autohide")
+        if options.autohide then
+            cache.mouse.autohide = mp.get_property_native("cursor-autohide")
+        end
+    end
+    local x, y = mp.get_mouse_pos()
+    if x ~= cache.mouse.pos_x or y ~= cache.mouse.pos_y then
+        cache.mouse.pos_x = x
+        cache.mouse.pos_y = y
+        cache.mouse.last = mp.get_time()
     end
     local events = events_at(pos)
     table.sort(events, compare_subs)
     local ass = assdraw.ass_new()
-    local x, y = mp.get_mouse_pos()
+    local show = false
     local pos_x = (x - border_x) * scale + cache.offset_x
     local pos_y = (y - border_y) * scale + cache.offset_y
+    local to_copy = {}
     for i, v in ipairs(events) do
         local track_event = event_track(v.event, v.index)
         local min_x, min_y, max_x, max_y = bounds(track_event, pos, v.index)
-        if pos_x > min_x and pos_x < max_x and pos_y > min_y and pos_y < max_y then
+        if show_all or (options.on_hover and pos_x > min_x and pos_x < max_x and pos_y > min_y and pos_y < max_y) then
             if copy == true then
-                copy_subs(ffi.string(v.event.Text):gsub("{\\([^}]*p1.*?\\p0)[^}]*}", ""):gsub("{\\([^}]*p1)[^}]*}.*", ""):gsub("{\\[^}]+}", ""):gsub("\\N", "\n"):gsub("\\n", "\n"):gsub("\\h", " "))
+                local line = ffi.string(v.event.Text):gsub("{\\([^}]*p1.*?\\p0)[^}]*}", ""):gsub("{\\([^}]*p1)[^}]*}.*", ""):gsub("{\\[^}]+}", ""):gsub("\\N", "\n"):gsub("\\n", "\n"):gsub("\\h", " ")
+                if line ~= "" then
+                    to_copy[#to_copy+1] = line
+                end
             end
-            if x ~= cache.mouse.pos_x or y ~= cache.mouse.pos_y then
-                cache.mouse.pos_x = x
-                cache.mouse.pos_y = y
-                cache.mouse.last = os.time()
-            elseif type(cache.mouse.autohide) == "number" and (not mp.get_property_native("cursor-autohide-fs-only") or mp.get_property_native("fullscreen")) and os.time() * 1000 - cache.mouse.last * 1000 > round(cache.mouse.autohide, -3) then
+            if not show_all and options.autohide and type(cache.mouse.autohide) == "number" and (not mp.get_property_native("cursor-autohide-fs-only") or mp.get_property_native("fullscreen")) and mp.get_time() * 1000 - cache.mouse.last * 1000 > cache.mouse.autohide then
                 break
             end
-            if cache.last == v.index then
-                return
-            end
+            if cache.last == v.index then return end
             cache.last = v.index
+            min_x = math.max(min_x, 2)
+            min_y = math.max(min_y, 2)
+            max_x = math.min(max_x, width - 2)
+            max_y = math.min(max_y, height - 2)
             ass:new_event()
             ass:append("{\\3c&H0000ff&}")
             ass:append("{\\bord2}")
@@ -277,23 +310,94 @@ local function tick(copy)
             ass:line_to(max_x, max_y)
             ass:line_to(min_x, max_y)
             ass:draw_stop()
-            mp.set_osd_ass(width, height, ass.text)
-            return
+            show = true
+            if not show_all then break end
         end
     end
-    if cache.last ~= 0 then
-        mp.set_osd_ass(width, height, "")
+    if copy == true then
+        copy_subs(table.concat(to_copy, "\n"))
     end
+    mp.set_osd_ass(width, height, ass.text)
     cache.last = 0
 end
 
-local function file_loaded(reload)
-    copy_tmpfile(reload)
-    init_libass()
+function init_track()
+    local track_list = mp.get_property_native("track-list")
+    for i, v in ipairs(track_list) do
+        if v.type == "sub" and v.selected and (v.codec == "ass" or v.codec == "ssa") then
+            if not v.external then
+                if ffmpeg == nil and v["ff-index"] == last_extracted then return init_libass() end
+                if ffmpeg ~= nil then
+                    mp.abort_async_command(ffmpeg)
+                    ffmpeg = nil
+                end
+                last_extracted = v["ff-index"]
+                cache.index = v["ff-index"]
+                ffmpeg = mp.command_native_async({"subprocess", {
+                    "ffmpeg", "-loglevel", "8",
+                    "-i", cache.file,
+                    "-map", "0:" .. v["ff-index"],
+                    "-y", options.tmp_ass
+                }}, init_libass)
+            else
+                if v["external-filename"] == cache.index then return end
+                cache.index = v["external-filename"]
+                init_libass(v["external-filename"])
+            end
+            return
+        end
+    end
+    clear_subs()
+end
+
+function file_loaded()
+    mp.unregister_event(init_track)
+    local path = mp.get_property_native("path")
+    if not path then return end
+    local working_directory = mp.get_property_native("working-directory")
+    local file = utils.join_path(working_directory, path)
+    local skip = true
+    local track_list = mp.get_property_native("track-list")
+    for i, v in ipairs(track_list) do
+        if v.type == "sub" and (v.codec == "ass" or v.codec == "ssa") then
+            skip = false
+            break
+        end
+    end
+
+    if skip then return clear_subs() end
+    if file ~= cache.file then
+        cache.file = file
+        fonts = utils.readdir(options.fonts_dir, "files")
+        if fonts then
+            for _, font in ipairs(fonts) do
+                os.remove(utils.join_path(options.fonts_dir, font))
+            end
+        end
+        local tracks = mp.command_native{name = "subprocess", capture_stdout = true, playback_only = false, args = {
+            "mkvmerge",
+            "-J",
+            file
+        }}
+        local json = utils.parse_json(tracks.stdout)
+        local args = {"mkvextract", "attachments", file}
+        for key, value in pairs(json.attachments) do
+            table.insert(args, value.id .. ":" .. options.fonts_dir .. "/" .. value.file_name)
+        end
+        mp.command_native_async({name = "subprocess", playback_only = false, args = args}, init_track)
+        mp.register_event("track-switched", init_track)
+    else
+        init_track()
+        mp.register_event("track-switched", init_track)
+    end
+end
+
+function toggle_bounds()
+    show_all = not show_all
 end
 
 mp.register_event("file-loaded", file_loaded)
 mp.register_event("tick", tick)
 
 mp.add_key_binding("c", "copy-subs", function() return tick(true) end)
-mp.add_key_binding("l", "reload-subs", function() return file_loaded(true) end)
+mp.add_key_binding("b", "toggle-bounds", toggle_bounds)
